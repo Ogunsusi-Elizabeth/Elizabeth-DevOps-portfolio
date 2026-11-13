@@ -25,10 +25,7 @@ A responsive personal portfolio documenting my DevOps learning journey and proje
 
 ## Run the site on EC2
 
-Connect to the EC2 instance, then run:
+First connect to EC2 from Windows PowerShell:
 
-```bash
-cd /home/ubuntu/Elizabeth-DevOps-portfolio
-docker build -t elizabeth-portfolio:manual .
-docker rm -f elizabeth-portfolio 2>/dev/null || true
-docker run -d --name elizabeth-portfolio -p 80:80 --restart unless-stopped elizabeth-portfolio:manual
+```powershell
+ssh -i "$HOME\Downloads\portfolio-docker-key.pem" ubuntu@ec2-13-60-104-0.eu-north-1.compute.amazonaws.com
