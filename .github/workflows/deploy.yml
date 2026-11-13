@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,45 +13,100 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      EC2_INSTANCE_ID: i-0ffeebb5e65b09f0b
+      SITE_URL: http://ec2-13-60-104-0.eu-north-1.compute.amazonaws.com/
+
     steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate site and test Docker image
+        run: |
+          set -euo pipefail
+          test -s index.html
+          test -f Dockerfile
+          test -s assets/OGUNSUSI-Elizabeth-Bukola-CV.pdf
+          grep -q 'href="#projects"' index.html
+
+          docker build -t elizabeth-portfolio:ci .
+          docker run --detach --name portfolio-smoke-test -p 8080:80 elizabeth-portfolio:ci
+          trap 'docker rm -f portfolio-smoke-test >/dev/null 2>&1 || true' EXIT
+
+          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:8080/ --output /tmp/portfolio-home.html
+          grep -q "OGUNSUSI" /tmp/portfolio-home.html
+          curl --fail --silent --show-error \
+            http://127.0.0.1:8080/assets/OGUNSUSI-Elizabeth-Bukola-CV.pdf \
+            --output /dev/null
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: arn:aws:iam::922839637125:role/github-actions-portfolio-deploy-role
           aws-region: eu-north-1
 
-      - name: Deploy through Systems Manager
-        shell: bash
+      - name: Prepare deployment for this exact commit
         run: |
-          cat > ssm-command.json <<'JSON'
-          {
-            "InstanceIds": ["i-0ffeebb5e65b09f0b"],
-            "DocumentName": "AWS-RunShellScript",
-            "Comment": "Deploy portfolio from GitHub Actions",
-            "Parameters": {
-              "commands": [
-                "set -e",
-                "sudo -u ubuntu -H bash -lc 'cd /home/ubuntu/Elizabeth-DevOps-portfolio && git pull --ff-only origin main && docker build -t elizabeth-portfolio .'",
-                "docker rm -f elizabeth-portfolio || true",
-                "docker run -d --name elizabeth-portfolio -p 80:80 --restart unless-stopped elizabeth-portfolio"
-              ]
-            }
-          }
-          JSON
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shlex
 
+          sha = os.environ["GITHUB_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("Unexpected commit SHA")
+
+          deploy_script = (
+              "set -e; "
+              "cd /home/ubuntu/Elizabeth-DevOps-portfolio; "
+              "git fetch origin main; "
+              f"git checkout --detach {sha}; "
+              f"docker build -t elizabeth-portfolio:{sha} ."
+          )
+
+          payload = {
+              "InstanceIds": [os.environ["EC2_INSTANCE_ID"]],
+              "DocumentName": "AWS-RunShellScript",
+              "Comment": f"Deploy portfolio commit {sha}",
+              "Parameters": {
+                  "commands": [
+                      "set -e",
+                      "sudo -u ubuntu -H bash -lc " + shlex.quote(deploy_script),
+                      "docker rm -f elizabeth-portfolio || true",
+                      f"docker run -d --name elizabeth-portfolio -p 80:80 --restart unless-stopped elizabeth-portfolio:{sha}"
+                  ]
+              }
+          }
+
+          with open("ssm-command.json", "w", encoding="utf-8") as command_file:
+              json.dump(payload, command_file)
+          PY
+
+          echo "Deploying commit $GITHUB_SHA"
           COMMAND_ID=$(aws ssm send-command \
             --cli-input-json file://ssm-command.json \
             --query "Command.CommandId" \
             --output text)
-
           echo "SSM command ID: $COMMAND_ID"
 
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "i-0ffeebb5e65b09f0b"
+            --instance-id "$EC2_INSTANCE_ID"
 
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
-            --instance-id "i-0ffeebb5e65b09f0b" \
-            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent}' \
             --output json
+
+      - name: Check public website
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 6 \
+            "$SITE_URL" --output /tmp/live-portfolio.html
+          grep -q "OGUNSUSI" /tmp/live-portfolio.html
+          echo "Public website responded successfully at $SITE_URL"
